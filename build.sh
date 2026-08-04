@@ -1,148 +1,104 @@
 #!/bin/bash
+#
+# hanoip-kernel build script
+#
+# Flow:
+#   1) choose config source:
+#        1) fresh  - delete old .config, run hanoip_defconfig
+#        2) reuse  - keep last out/.config (oldconfig)
+#   2) edit out/.config in menuconfig  (save&exit to continue)  [TTY only]
+#   3) make reconciles .config (oldconfig/syncconfig) and builds the kernel
+#
+# Interactive choice + menuconfig run only when stdin is a TTY; a non-TTY run
+# does a fresh defconfig + build (CI-safe, never blocks on input).
+#
+set -euo pipefail
 
-# Initialize variables
+export ARCH=arm64
+export SUBARCH=arm64
 
-GRN='\033[01;32m'
-CYAN='\033[0;36m'
-YELLOW='\033[1;33m'
-RED='\033[01;31m'
-RST='\033[0m'
-ORIGIN_DIR=$(pwd)
-TOOLCHAIN=$ORIGIN_DIR/build-shit
-IMAGE=$ORIGIN_DIR/out/arch/arm64/boot/Image.gz
-DEVICE=hanoip
-CONFIG="${DEVICE}_defconfig"
-FP_MODEL="$*"
-CPO+=(
-    ./scripts/config \
-        --file "$ORIGIN_DIR"/out/.config \
-        -d FINGERPRINT_FPC_TEE_MMI \
-        -e FINGERPRINT_CHIPONE_FPS_MMI
+TOOLCHAIN="/home/rani/clang/bin"
+OUT_DIR="out"
+JOBS="$(nproc --all)"
+DEFCONFIG="hanoip_defconfig"
+
+# Make variables (matches the manual invocation).
+MAKE_ARGS=(
+	ARCH=arm64
+	CC="$TOOLCHAIN/clang"
+	CLANG_TRIPLE=aarch64-linux-gnu-
+	LD="$TOOLCHAIN/ld.lld"
+	AR="$TOOLCHAIN/llvm-ar"
+	NM="$TOOLCHAIN/llvm-nm"
+	OBJCOPY="$TOOLCHAIN/llvm-objcopy"
+	OBJDUMP="$TOOLCHAIN/llvm-objdump"
+	STRIP="$TOOLCHAIN/llvm-strip"
+	CROSS_COMPILE="$TOOLCHAIN/aarch64-linux-gnu-"
+	CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+	LLVM=1
+	LLVM_IAS=1
+	KCFLAGS="-Wno-error -Wno-unknown-warning-option -Wno-incompatible-pointer-types"
 )
-MAKE+=(
-    -j$(($(nproc)+1)) \
-        O=out \
-        CROSS_COMPILE=aarch64-elf- \
-        CROSS_COMPILE_ARM32=arm-eabi- \
-        HOSTCC=gcc \
-        HOSTCXX=aarch64-elf-g++ \
-        CC=aarch64-elf-gcc \
-        LD=ld.lld
-)
 
-# export environment variables
-export_env_vars() {
-    export KBUILD_BUILD_USER=Const
-    export KBUILD_BUILD_HOST=Coccinelle
-    export ARCH=arm64
+# --- 1) choose fresh defconfig or reuse last .config ---
+FRESH=1   # default
+if [ -t 0 ]; then
+	echo
+	echo "Select config source:"
+	echo "  1) fresh  - delete old .config and run $DEFCONFIG"
+	echo "  2) reuse  - keep last out/.config (oldconfig) and edit"
+	echo -n "choice [1/2] (default 1): "
+	if ! read -r choice; then choice=""; fi
+	case "$choice" in
+		2|reuse)
+			if [ -f "$OUT_DIR/.config" ]; then
+				FRESH=0
+			else
+				echo ">> no existing .config; using fresh defconfig"
+				FRESH=1
+			fi
+			;;
+		*)
+			FRESH=1
+			;;
+	esac
+else
+	echo ">> non-TTY: fresh defconfig (CI-safe)"
+	FRESH=1
+fi
 
-    # CCACHE
-    export USE_CCACHE=1
-    export CCACHE_SLOPPINESS="file_macro,locale,time_macros"
-    export CCACHE_NOHASHDIR="true"
-}
+if [ "$FRESH" = "1" ]; then
+	echo ">> fresh defconfig: resetting $OUT_DIR"
+	rm -rf "$OUT_DIR"
+	mkdir -p "$OUT_DIR"
+	echo ">> defconfig"
+	make O="$OUT_DIR" hanoip_defconfig "${MAKE_ARGS[@]}"
+else
+	mkdir -p "$OUT_DIR"
+	echo ">> reusing last $OUT_DIR/.config (oldconfig)"
+fi
 
-script_echo() {
-    echo "  $1"
-}
-exit_script() {
-    kill -INT $$
-}
-add_deps() {
-    echo -e "${CYAN}"
-    if [ ! -d "$TOOLCHAIN" ]
-    then
-        script_echo "Create build-shit folder"
-        mkdir "$TOOLCHAIN"
-    fi
+# --- 2) let the user tweak .config (interactive only) ---
+if [ -t 0 ] && [ -f "$OUT_DIR/.config" ]; then
+	echo ">> out/.config ready - edit it now (Save&Exit to continue, or just Exit to keep)"
+	make O="$OUT_DIR" menuconfig "${MAKE_ARGS[@]}" 2>/dev/null \
+		|| make O="$OUT_DIR" nconfig "${MAKE_ARGS[@]}" 2>/dev/null \
+		|| "${EDITOR:-vi}" "$OUT_DIR/.config" || true
+fi
 
-    if [ ! -d "$TOOLCHAIN/gcc-arm64" ]
-    then
-        script_echo "Downloading toolchain...."
-        cd "$TOOLCHAIN" || exit
-        git clone https://github.com/KenHV/gcc-arm64.git --single-branch -b master --depth=1 2>&1 | sed 's/^/     /'
-        git clone https://github.com/KenHV/gcc-arm.git --single-branch -b master --depth=1 2>&1 | sed 's/^/     /'
-        cd ../
-    fi
-    verify_toolchain_install
-}
-verify_toolchain_install() {
-    script_echo " "
-    if [[ -d "${TOOLCHAIN}" ]]; then
-        script_echo "I: Toolchain found at default location"
-        export PATH="${TOOLCHAIN}/gcc-arm64/bin:${PATH}:${TOOLCHAIN}/gcc-arm/bin:${PATH}"
-    else
-        script_echo "I: Toolchain not found"
-        script_echo "   Downloading recommended toolchain at ${TOOLCHAIN}..."
-        add_deps
-    fi
-}
-build_kernel_image() {
-    cleanup
-    script_echo " "
-    echo -e "${GRN}"
-    read -p "Write the Kernel version: " KV
-    echo -e "${YELLOW}"
-    script_echo "Building CosmicFresh Kernel For $DEVICE"
+# --- 3) reconcile .config (oldconfig) then build ---
+echo ">> oldconfig (reconcile .config with Kconfig - answers new symbols with defaults)"
+make O="$OUT_DIR" olddefconfig "${MAKE_ARGS[@]}" >/dev/null 2>&1 || true
 
-    make "${MAKE[@]}" LOCALVERSION="—CosmicFresh-R$KV" $CONFIG 2>&1 | sed 's/^/     /'
+echo ">> building kernel + modules  (-j${JOBS})  ->  $OUT_DIR/arch/arm64/boot/Image.gz"
+make O="$OUT_DIR" -j"$JOBS" "${MAKE_ARGS[@]}"
 
-    echo -e "${GRN}"
-    if [ "$FP_MODEL" = "CPO" ]; then
-        "${CPO[@]}"
-    else
-        FP_MODEL="FPC"
-    fi
-    echo -e "${YELLOW}"
+echo ">> building dtbs + dtbo.img"
+make O="$OUT_DIR" -j"$JOBS" "${MAKE_ARGS[@]}" dtbs dtbo.img
 
-    make "${MAKE[@]}" LOCALVERSION="—CosmicFresh-R$KV" 2>&1 | sed 's/^/     /'
-
-    make "${MAKE[@]}" dtbs dtbo.img 2>&1 | sed 's/^/     /'
-
-    SUCCESS=$?
-    echo -e "${RST}"
-
-    if [ $SUCCESS -eq 0 ] && [ -f "$IMAGE" ]
-    then
-        echo -e "${GRN}"
-        script_echo "------------------------------------------------------------"
-        script_echo "Compilation successful..."
-        script_echo "Image can be found at out/arch/arm64/boot/Image.gz"
-        script_echo  "------------------------------------------------------------"
-        build_flashable_zip
-    elif [ $SUCCESS -eq 130 ]
-    then
-        echo -e "${RED}"
-        script_echo "------------------------------------------------------------"
-        script_echo "Build force stopped by the user."
-        script_echo "------------------------------------------------------------"
-        echo -e "${RST}"
-    elif [ $SUCCESS -eq 1 ]
-    then
-        echo -e "${RED}"
-        script_echo "------------------------------------------------------------"
-        script_echo "Compilation failed.."
-        script_echo "------------------------------------------------------------"
-        echo -e "${RST}"
-        cleanup
-    fi
-}
-build_flashable_zip() {
-    script_echo " "
-    script_echo "I: Building kernel image..."
-    echo -e "${GRN}"
-    cp "$ORIGIN_DIR"/out/arch/arm64/boot/{Image.gz,dtbo.img} CosmicFresh/
-    cp "$ORIGIN_DIR"/out/arch/arm64/boot/dts/qcom/sdmmagpie-hanoi-base.dtb CosmicFresh/dtb
-    cd "$ORIGIN_DIR"/CosmicFresh/ || exit
-    zip -r9 "CosmicFresh-R$KV-$FP_MODEL.zip" META-INF version anykernel.sh tools Image.gz dtb dtbo.img
-    rm -rf {Image.gz,dtb,dtbo.img}
-    cd ../
-}
-
-cleanup() {
-    rm -rf "$ORIGIN_DIR"/out/arch/arm64/boot/{Image.gz,dt*}
-    rm -rf "$ORIGIN_DIR"/CosmicFresh/{Image.gz,*.zip,dt*}
-}
-add_deps
-export_env_vars
-build_kernel_image
+echo ">> build artifacts:"
+ls -l "$OUT_DIR/arch/arm64/boot/Image" \
+	"$OUT_DIR/arch/arm64/boot/Image.gz" \
+	"$OUT_DIR/arch/arm64/boot/dts/qcom/sdmmagpie-hanoi-base.dtb" \
+	"$OUT_DIR/arch/arm64/boot/dtbo.img" 2>/dev/null || true
+echo ">> done."
