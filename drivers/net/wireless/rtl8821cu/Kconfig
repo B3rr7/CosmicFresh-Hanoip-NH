@@ -1,0 +1,8 @@
+config RTL8821CU
+	tristate "Realtek RTL8821CU USB WiFi"
+	depends on USB
+	select CFG80211
+	select MAC80211
+	help
+	  Realtek RTL8821CU USB WiFi driver with monitor and injection support.
+
